@@ -153,7 +153,7 @@ with right:
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("✅ Capture Delivery Proof Frame", use_container_width=True):
+        if st.button("✅ Capture Delivery Proof Frame", use_column_width=True):
             frame = read_frame_at_time(video_path, t1)
             if frame is None:
                 st.error("Could not read frame. Try another timestamp.")
@@ -162,7 +162,7 @@ with right:
                 st.session_state["delivery_time"] = t1
 
     with c2:
-        if st.button("🏠 Capture Location Proof Frame", use_container_width=True):
+        if st.button("🏠 Capture Location Proof Frame", use_column_width=True):
             frame = read_frame_at_time(video_path, t2)
             if frame is None:
                 st.error("Could not read frame. Try another timestamp.")
@@ -176,11 +176,11 @@ with right:
 
     if df is not None:
         st.markdown(f"**Delivery Proof (t={st.session_state['delivery_time']:.1f}s)**")
-        st.image(df, use_container_width=True)
+        st.image(df, use_column_width=True)
 
     if lf is not None:
         st.markdown(f"**Location Proof (t={st.session_state['location_time']:.1f}s)**")
-        st.image(lf, use_container_width=True)
+        st.image(lf, use_column_width=True)
 
     st.markdown("---")
     st.subheader("🧾 Validation Inputs (Client-friendly)")
@@ -199,7 +199,7 @@ with right:
     st.markdown("---")
     st.subheader("🧠 Validate Delivery (Right person • Right place • Right time)")
 
-    validate_btn = st.button("🔍 Run Validation", type="primary", use_container_width=True)
+    validate_btn = st.button("🔍 Run Validation", type="primary", use_column_width=True)
 
     if validate_btn:
         if df is None or lf is None:
@@ -297,22 +297,22 @@ with right:
                 e1, e2 = st.columns(2)
                 with e1:
                     st.caption("Delivery Proof Frame")
-                    st.image(df, use_container_width=True)
+                    st.image(df, use_column_width=True)
                     if df_face is not None:
                         st.caption("Detected Face Crop (Delivery)")
-                        st.image(df_face, use_container_width=True)
+                        st.image(df_face, use_column_width=True)
                 with e2:
                     st.caption("Location Proof Frame")
-                    st.image(lf, use_container_width=True)
+                    st.image(lf, use_column_width=True)
                     if ref_loc_rgb is not None:
                         st.caption("Reference Location Image")
-                        st.image(ref_loc_rgb, use_container_width=True)
+                        st.image(ref_loc_rgb, use_column_width=True)
                     if ref_face_rgb is not None:
                         st.caption("Reference Recipient Image")
-                        st.image(ref_face_rgb, use_container_width=True)
+                        st.image(ref_face_rgb, use_column_width=True)
                         if ref_face_crop is not None:
                             st.caption("Detected Face Crop (Reference)")
-                            st.image(ref_face_crop, use_container_width=True)
+                            st.image(ref_face_crop, use_column_width=True)
 
             st.info(
                 "Note for client demo: location/recipient checks here use fast visual similarity as a placeholder. "
