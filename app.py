@@ -4,12 +4,17 @@ import cv2
 import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS
+import math
 
 # =========================================================
-# CLIENT DEMO APP: Proof-of-Delivery + Location Validation
+# CLIENT DEMO APP: Proof-of-Delivery + Location Validation + GEO Validation
 # Streamlit-Cloud-safe version:
 # - NO use_container_width / use_column_width on buttons
 # - st.image uses use_column_width (most compatible)
+# - Adds Geofence validation:
+#     Claimed Lat/Lon (address master/order) vs Captured Lat/Lon (photo EXIF GPS or manual)
 # =========================================================
 
 # ---------- CONFIG ----------
@@ -18,7 +23,7 @@ st.set_page_config(page_title="Delivery Vision Validation (Client Demo)", layout
 # ✅ Repo-friendly default (recommended):
 # DEFAULT_VIDEO = Path("assets/demo_delivery_clip.mp4")
 # ✅ Your current mounted path (works in your local/container):
-DEFAULT_VIDEO = Path("assets/demo_delivery_clip.mp4")
+DEFAULT_VIDEO = Path("/mnt/data/6034753-uhd_4096_2160_24fps.mp4")
 
 # ---------- HELPERS ----------
 def get_video_info(video_path: Path):
@@ -87,6 +92,7 @@ def safe_confidence(score, min_s=-0.2, max_s=1.0):
     return float((s - min_s) / (max_s - min_s) * 100.0)
 
 def bytes_to_rgb(uploaded_file):
+    # NOTE: file_uploader streams are one-time reads
     if uploaded_file is None:
         return None
     data = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
@@ -94,6 +100,71 @@ def bytes_to_rgb(uploaded_file):
     if bgr is None:
         return None
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+# -------- GEO helpers (EXIF + distance) --------
+def haversine_m(lat1, lon1, lat2, lon2):
+    # distance in meters
+    R = 6371000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+def _ratio_to_float(r):
+    try:
+        return float(r[0]) / float(r[1])
+    except Exception:
+        try:
+            return float(r)
+        except Exception:
+            return None
+
+def _dms_to_deg(dms, ref):
+    if dms is None or ref is None:
+        return None
+    d = _ratio_to_float(dms[0])
+    m = _ratio_to_float(dms[1])
+    s = _ratio_to_float(dms[2])
+    if d is None or m is None or s is None:
+        return None
+    deg = d + (m / 60.0) + (s / 3600.0)
+    if ref in ["S", "W"]:
+        deg = -deg
+    return deg
+
+def extract_gps_from_image(uploaded_file):
+    """
+    Try to read EXIF GPS from a phone photo.
+    Returns (lat, lon) or (None, None)
+    """
+    if uploaded_file is None:
+        return (None, None)
+    try:
+        img = Image.open(uploaded_file)
+        exif = img._getexif()
+        if not exif:
+            return (None, None)
+
+        exif_data = {}
+        for tag, value in exif.items():
+            decoded = TAGS.get(tag, tag)
+            exif_data[decoded] = value
+
+        gps_info = exif_data.get("GPSInfo")
+        if not gps_info:
+            return (None, None)
+
+        gps_parsed = {}
+        for k, v in gps_info.items():
+            gps_parsed[GPSTAGS.get(k, k)] = v
+
+        lat = _dms_to_deg(gps_parsed.get("GPSLatitude"), gps_parsed.get("GPSLatitudeRef"))
+        lon = _dms_to_deg(gps_parsed.get("GPSLongitude"), gps_parsed.get("GPSLongitudeRef"))
+        return (lat, lon)
+    except Exception:
+        return (None, None)
 
 def init_session():
     st.session_state.setdefault("delivery_frame", None)
@@ -106,7 +177,7 @@ init_session()
 
 # ---------- HEADER ----------
 st.title("📦 Proof-of-Delivery Vision + Location Validation (Client Demo)")
-st.caption("Video → Capture → Validate (recipient + location) → GenBI-style KPIs. Offline, demo-safe logic.")
+st.caption("Video → Capture → Validate (recipient + location + geo) → GenBI-style KPIs. Offline, demo-safe logic.")
 
 # ---------- INPUTS ----------
 left, right = st.columns([1.35, 1])
@@ -210,8 +281,60 @@ with right:
     claimed_lat = st.text_input("Claimed latitude", value="25.2048")
     claimed_lon = st.text_input("Claimed longitude", value="55.2708")
 
+    # =========================
+    # 🗺️ GEO VALIDATION (NEW)
+    # =========================
     st.markdown("---")
-    st.subheader("🧠 Validate Delivery (Right person • Right place • Right time)")
+    st.subheader("🗺️ Geo Validation (Claimed vs Captured)")
+
+    captured_photo = st.file_uploader(
+        "Upload **Captured Photo** from delivery device (phone photo preferred; EXIF GPS if available)",
+        type=["jpg", "jpeg", "png"],
+        key="captured_photo"
+    )
+
+    # EXIF GPS (if any)
+    exif_lat, exif_lon = extract_gps_from_image(captured_photo)
+
+    colg1, colg2, colg3 = st.columns(3)
+    with colg1:
+        geo_source = st.selectbox("Captured GPS Source", ["Auto (EXIF if present)", "Manual (demo)"])
+    with colg2:
+        captured_lat_manual = st.text_input("Captured latitude (manual)", value="")
+    with colg3:
+        captured_lon_manual = st.text_input("Captured longitude (manual)", value="")
+
+    geo_radius_m = st.slider("Geofence radius (meters)", 10, 500, 100, 10)
+
+    # Parse claimed coords
+    try:
+        claimed_lat_f = float(claimed_lat)
+        claimed_lon_f = float(claimed_lon)
+    except Exception:
+        claimed_lat_f, claimed_lon_f = None, None
+
+    # Resolve captured coords
+    captured_lat, captured_lon = None, None
+    if geo_source.startswith("Auto") and exif_lat is not None and exif_lon is not None:
+        captured_lat, captured_lon = float(exif_lat), float(exif_lon)
+    else:
+        try:
+            if captured_lat_manual.strip() != "" and captured_lon_manual.strip() != "":
+                captured_lat, captured_lon = float(captured_lat_manual), float(captured_lon_manual)
+        except Exception:
+            captured_lat, captured_lon = None, None
+
+    if captured_lat is not None and captured_lon is not None:
+        st.success(f"Captured GPS available: `{captured_lat:.6f}, {captured_lon:.6f}`")
+    else:
+        st.warning("No captured GPS yet. Upload a phone photo with EXIF GPS OR enter manual lat/long (demo).")
+
+    if claimed_lat_f is None or claimed_lon_f is None:
+        st.warning("Claimed lat/long is invalid — correct it to run geo validation.")
+
+    # ---------- VALIDATION ----------
+    st.markdown("---")
+    st.subheader("🧠 Validate Delivery (Right person • Right place • Right time • Right geo)")
 
     validate_btn = st.button("🔍 Run Validation", type="primary")
 
@@ -259,6 +382,17 @@ with right:
             time_status = "PASS" if time_gap <= 10.0 else "REVIEW"
             time_conf = 90.0 if time_status == "PASS" else 55.0
 
+            # --- GEO plausibility (NEW) ---
+            geo_status, geo_conf, geo_dist_m = "NOT CHECKED", None, None
+            if (
+                claimed_lat_f is not None and claimed_lon_f is not None and
+                captured_lat is not None and captured_lon is not None
+            ):
+                geo_dist_m = haversine_m(claimed_lat_f, claimed_lon_f, captured_lat, captured_lon)
+                geo_status = "PASS" if geo_dist_m <= geo_radius_m else "REVIEW"
+                # confidence: closer is better; purely demo-friendly
+                geo_conf = max(0.0, 100.0 - (geo_dist_m / geo_radius_m) * 50.0) if geo_radius_m > 0 else 0.0
+
             # --- Overall decision ---
             checks = []
             if loc_status != "NOT CHECKED":
@@ -266,6 +400,8 @@ with right:
             if person_status != "NOT CHECKED":
                 checks.append(person_status)
             checks.append(time_status)
+            if geo_status != "NOT CHECKED":
+                checks.append(geo_status)
 
             overall = "PASS" if all(c == "PASS" for c in checks) else "REVIEW"
 
@@ -278,6 +414,12 @@ with right:
                 "person_conf": person_conf,
                 "time_status": time_status,
                 "time_conf": time_conf,
+                "geo_status": geo_status,
+                "geo_conf": geo_conf,
+                "geo_dist_m": geo_dist_m,
+                "geo_radius_m": geo_radius_m,
+                "captured_lat": captured_lat,
+                "captured_lon": captured_lon,
                 "claimed_address": claimed_address,
                 "claimed_lat": claimed_lat,
                 "claimed_lon": claimed_lon,
@@ -287,11 +429,15 @@ with right:
             st.session_state["validation_log"].append(record)
 
             st.markdown("### ✅ Validation Result")
-            k1, k2, k3, k4 = st.columns(4)
+            k1, k2, k3, k4, k5 = st.columns(5)
             k1.metric("Overall", overall)
             k2.metric("Location", loc_status, f"{(loc_conf or 0):.0f}%")
             k3.metric("Recipient", person_status, f"{(person_conf or 0):.0f}%")
-            k4.metric("Time Plausibility", time_status, f"{time_conf:.0f}%")
+            k4.metric("Time", time_status, f"{time_conf:.0f}%")
+            if geo_dist_m is None:
+                k5.metric("Geo", geo_status, "—")
+            else:
+                k5.metric("Geo", geo_status, f"{geo_dist_m:.0f} m")
 
             with st.expander("Show evidence frames"):
                 e1, e2 = st.columns(2)
@@ -314,9 +460,18 @@ with right:
                             st.caption("Detected Face Crop (Reference)")
                             st.image(ref_face_crop, use_column_width=True)
 
+                if geo_dist_m is not None:
+                    st.caption("Geo Evidence")
+                    st.write(f"- Claimed: `{claimed_lat_f:.6f}, {claimed_lon_f:.6f}`")
+                    st.write(f"- Captured: `{captured_lat:.6f}, {captured_lon:.6f}`")
+                    st.write(f"- Distance: **{geo_dist_m:.1f} m** (radius {geo_radius_m} m)")
+                    st.markdown(
+                        f"[Open claimed location in Google Maps](https://www.google.com/maps?q={claimed_lat_f},{claimed_lon_f})"
+                    )
+
             st.info(
-                "Demo note: similarity checks are placeholders (offline). "
-                "Production: face embeddings + liveness + geofencing + OCR/barcode + device attestation."
+                "Demo note: similarity + geo checks are placeholders (offline). "
+                "Production: face embeddings + liveness + geofencing from device GPS + OCR/barcode + device attestation."
             )
 
 # =========================================================
@@ -355,11 +510,15 @@ else:
 
     st.markdown("**Recent Validation Events**")
     for r in log[-5:][::-1]:
+        geo_str = "Geo: N/A"
+        if r.get("geo_dist_m") is not None:
+            geo_str = f"Geo: {r['geo_status']} ({r['geo_dist_m']:.0f} m)"
         st.write(
             f"- `{r['ts']}` • **{r['overall']}** • "
             f"Location: {r['location_status']} ({(r['location_conf'] or 0):.0f}%) • "
             f"Recipient: {r['person_status']} ({(r['person_conf'] or 0):.0f}%) • "
             f"Time: {r['time_status']} • "
+            f"{geo_str} • "
             f"Addr: {r['claimed_address']}"
         )
 
@@ -382,8 +541,14 @@ if query:
         total = len(log)
         passed = sum(1 for r in log if r["overall"] == "PASS")
         ans = f"Current pass rate is **{(passed/total*100):.0f}%** ({passed}/{total})."
+    elif "geo" in q and ("distance" in q or "far" in q):
+        distances = [r["geo_dist_m"] for r in log if r.get("geo_dist_m") is not None]
+        if len(distances) == 0:
+            ans = "No geo distances computed yet. Provide captured GPS (EXIF or manual) and valid claimed lat/lon."
+        else:
+            ans = f"Geo distances observed: min {min(distances):.0f} m, max {max(distances):.0f} m, avg {sum(distances)/len(distances):.0f} m."
     elif "why" in q and "review" in q:
-        drivers = {"Location": 0, "Recipient": 0, "Time": 0}
+        drivers = {"Location": 0, "Recipient": 0, "Time": 0, "Geo": 0}
         for r in log:
             if r["overall"] == "REVIEW":
                 if r["location_status"] == "REVIEW":
@@ -392,6 +557,8 @@ if query:
                     drivers["Recipient"] += 1
                 if r["time_status"] == "REVIEW":
                     drivers["Time"] += 1
+                if r.get("geo_status") == "REVIEW":
+                    drivers["Geo"] += 1
         top = max(drivers, key=drivers.get)
         ans = f"Most common review driver is **{top}**. Breakdown: {drivers}."
     else:
@@ -400,6 +567,7 @@ if query:
             "- How many needed review?\n"
             "- What is the pass rate?\n"
             "- Why review?\n"
+            "- What are the geo distances?\n"
             "- Show recent validation events"
         )
 
